@@ -871,6 +871,23 @@ async def handle_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await send_type_selection(context.application)
     logger.info("Type selection sent via /test.")
 
+async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отвечает любому пользователю и запускает первый прогон для владельца."""
+    user_id = update.effective_user.id
+    await update.message.reply_text(
+        "\U0001f916 Zetta Lead Bot \u0430\u043a\u0442\u0438\u0432\u0435\u043d! \u041d\u0430\u0447\u0438\u043d\u0430\u044e \u043f\u043e\u0438\u0441\u043a \u043b\u0438\u0434\u043e\u0432..."
+    )
+    logger.info(f"handle_start: user_id={user_id}")
+    if user_id == YOUR_PERSONAL_ID:
+        await send_type_selection(context.application)
+
+
+async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отвечает любому пользователю, написавшему боту."""
+    await update.message.reply_text(
+        "\U0001f916 Zetta Lead Bot \u0430\u043a\u0442\u0438\u0432\u0435\u043d! \u041d\u0430\u0447\u0438\u043d\u0430\u044e \u043f\u043e\u0438\u1089\u043a \u043b\u0438\u0434\u043e\u0432..."
+    )
+
 
 # ---------------------------------------------------------------------------
 # Scheduler
@@ -1027,6 +1044,7 @@ def main() -> None:
     asyncio.set_event_loop(_main_loop)
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("test", handle_test_command))
     app.add_handler(CommandHandler("schedule", handle_schedule_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
@@ -1034,6 +1052,12 @@ def main() -> None:
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.User(YOUR_PERSONAL_ID),
             handle_edited_post,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & ~filters.User(YOUR_PERSONAL_ID),
+            handle_any_message,
         )
     )
     app.add_error_handler(handle_telegram_error)
