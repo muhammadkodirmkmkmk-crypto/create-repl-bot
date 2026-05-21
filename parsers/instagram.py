@@ -10,6 +10,7 @@ from typing import AsyncIterator
 
 import httpx
 
+import state
 from config import INSTAGRAM_HASHTAGS, PAUSE_INSTAGRAM, OPENING_KEYWORDS
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,10 @@ async def run_forever(process_func):
     logger.info("Парсер Instagram запущен")
 
     while True:
+        if state.is_paused():
+            await asyncio.sleep(60)
+            continue
+
         try:
             items = await fetch_new_items()
             logger.info(f"Instagram: всего найдено {len(items)} постов")
