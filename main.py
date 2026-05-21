@@ -20,7 +20,7 @@ from parsers import instagram, olx, tg_channels, twogis
 from config import SCORE_HOT, SCORE_WARM, DIGEST_HOUR
 
 # ──────────────────────────────────────────────
-# Настройка логирования
+# Настройка логирования — только stdout (Railway не поддерживает файлы)
 # ──────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -28,7 +28,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("zetta_bot.log", encoding="utf-8"),
     ],
 )
 logger = logging.getLogger("zetta_bot")
@@ -108,7 +107,7 @@ async def run_one_test_cycle():
     total = 0
     for batch in results:
         if isinstance(batch, list):
-            for item in batch[:3]:  # Берём только первые 3 от каждого источника
+            for item in batch[:3]:
                 try:
                     await process_lead(item)
                     total += 1
@@ -173,17 +172,13 @@ async def main():
     await tg.send_startup_message()
 
     await asyncio.gather(
-        # Парсеры
         instagram.run_forever(process_lead),
         olx.run_forever(process_lead),
         tg_channels.run_forever(process_lead),
         twogis.run_forever(process_lead),
-        # Дайджест и перепроверка
         run_daily_digest(),
         run_watch_checker(),
-        # Самообучение
         brain_learning.run_forever(notify_func=tg.send_message),
-        # Telegram-команды (/status /sources /test /pause /resume)
         command_bot.run_forever(trigger_test_func=run_one_test_cycle),
     )
 
