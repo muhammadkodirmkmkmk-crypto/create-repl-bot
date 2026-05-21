@@ -10,6 +10,7 @@ from datetime import datetime
 import httpx
 from bs4 import BeautifulSoup
 
+import state
 from config import TG_CHANNELS, OPENING_KEYWORDS, PAUSE_TG_CHANNELS
 
 logger = logging.getLogger(__name__)
@@ -175,6 +176,10 @@ async def run_forever(process_func):
     logger.info("Парсер Telegram-каналов запущен")
 
     while True:
+        if state.is_paused():
+            await asyncio.sleep(60)
+            continue
+
         try:
             items = await fetch_new_items()
             logger.info(f"Telegram: всего найдено {len(items)} постов")
