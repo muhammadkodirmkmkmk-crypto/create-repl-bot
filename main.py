@@ -7,14 +7,16 @@ Zetta Lead Bot — автономный AI-агент для поиска лид
 import asyncio
 import logging
 import sys
-from datetime import datetime, time
+from datetime import datetime, timedelta
 
 import database
+import state
 from brain import decision as brain_decision
 from brain import learning as brain_learning
 from brain import memory as brain_memory
 from notifier import telegram_bot as tg
-from parsers import instagram, olx, tg_channels
+from notifier import command_bot
+from parsers import instagram, olx, tg_channels, twogis
 from config import SCORE_HOT, SCORE_WARM, DIGEST_HOUR
 
 # ──────────────────────────────────────────────
@@ -31,28 +33,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("zetta_bot")
 
-# Отключаем слишком шумные логи httpx
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 # ──────────────────────────────────────────────
-# Главная функция обработки одного лида
+# Обработка одного лида
 # ──────────────────────────────────────────────
 async def process_lead(raw_data: dict):
     """
-    Полный цикл обработки одного найденного заведения:
-    1. Анализ через Claude (brain/decision.py)
-    2. Проверка дублей и сохранение (brain/memory.py)
-    3. Отправка уведомления в Telegram (notifier/telegram_bot.py)
-    4. Обновление статистики источника
+    Полный цикл: Claude анализирует → проверяем дубль → отправляем в Telegram.
     """
     source = raw_data.get("source", "unknown")
     name = raw_data.get("name", "Без названия")
 
     logger.info(f"[{source.upper()}] Обрабатываю: {name}")
 
-    # Шаг 1 — анализ через Claude
     decision = await brain_decision.analyze_venue(raw_data)
     if not decision:
         logger.warning(f"Claude не смог проанализировать: {name}")
@@ -61,21 +57,16 @@ async def process_lead(raw_data: dict):
 
     decision_type = decision.get("decision", "skip")
     score = decision.get("lead_quality", {}).get("score", 0)
-
     logger.info(f"[{source.upper()}] Решение: {decision_type} | Скор: {score} | {name}")
 
-    # Шаг 2 — проверка дублей и сохранение
     lead_id, is_dup = await brain_memory.check_and_save_lead(raw_data, decision)
-
     if is_dup:
         database.update_source_stats(source, found=1)
         return
 
-    # Шаг 3 — отправка уведомления
     msg_id = None
 
     if decision_type == "send_now":
-        # Горячий лид — отправляем сразу
         logger.info(f"🔥 ГОРЯЧИЙ ЛИД: {name} (score={score})")
         msg_id = await tg.notify_hot_lead(raw_data, decision)
         if lead_id and msg_id:
@@ -83,12 +74,10 @@ async def process_lead(raw_data: dict):
         database.update_source_stats(source, found=1, sent=1, hot=1, score=score)
 
     elif decision_type == "send_digest":
-        # Тёплый лид — добавлен в базу, отправится в дайджесте
         logger.info(f"📋 Тёплый лид в дайджест: {name} (score={score})")
         database.update_source_stats(source, found=1, score=score)
 
     elif decision_type == "watch":
-        # На наблюдении — уведомляем и ждём 3 дня
         logger.info(f"👁 На наблюдении: {name}")
         msg_id = await tg.notify_watch_lead(raw_data, decision)
         if lead_id and msg_id:
@@ -96,36 +85,56 @@ async def process_lead(raw_data: dict):
         database.update_source_stats(source, found=1)
 
     elif decision_type == "skip":
-        # Пропускаем — не отправляем
         logger.info(f"⏭ Пропуск: {name}")
         database.update_source_stats(source, found=1)
+
+
+# ──────────────────────────────────────────────
+# Тестовый прогон (вызывается командой /test)
+# ──────────────────────────────────────────────
+async def run_one_test_cycle():
+    """
+    Немедленно запускает один прогон всех парсеров.
+    Используется командой /test.
+    """
+    logger.info("Тестовый прогон запущен...")
+    results = await asyncio.gather(
+        olx.fetch_new_items(),
+        tg_channels.fetch_new_items(),
+        twogis.fetch_new_items(),
+        instagram.fetch_new_items(),
+        return_exceptions=True,
+    )
+    total = 0
+    for batch in results:
+        if isinstance(batch, list):
+            for item in batch[:3]:  # Берём только первые 3 от каждого источника
+                try:
+                    await process_lead(item)
+                    total += 1
+                except Exception as e:
+                    logger.error(f"Ошибка в тестовом прогоне: {e}")
+    logger.info(f"Тестовый прогон завершён: обработано {total} заведений")
 
 
 # ──────────────────────────────────────────────
 # Утренний дайджест
 # ──────────────────────────────────────────────
 async def run_daily_digest():
-    """
-    Каждый день в DIGEST_HOUR:00 отправляет дайджест тёплых лидов.
-    """
+    """Каждый день в DIGEST_HOUR:00 отправляет дайджест тёплых лидов."""
     while True:
         now = datetime.now()
-        # Вычисляем сколько секунд до следующей отправки
         target = now.replace(hour=DIGEST_HOUR, minute=0, second=0, microsecond=0)
         if now >= target:
-            # Уже прошло сегодня — ждём до завтра
-            from datetime import timedelta
-            target = target + timedelta(days=1)
+            target += timedelta(days=1)
 
         wait_seconds = (target - now).total_seconds()
         logger.info(f"Дайджест: следующая отправка через {wait_seconds / 3600:.1f} часов")
         await asyncio.sleep(wait_seconds)
 
-        logger.info("Отправляю утренний дайджест...")
         leads = database.get_digest_leads()
         if leads:
             await tg.send_daily_digest(leads)
-            # Помечаем все как отправленные
             for lead in leads:
                 database.mark_lead_sent(lead.id)
             logger.info(f"Дайджест отправлен: {len(leads)} тёплых лидов")
@@ -137,12 +146,11 @@ async def run_daily_digest():
 # Перепроверка watch-лидов
 # ──────────────────────────────────────────────
 async def run_watch_checker():
-    """
-    Каждые 6 часов перепроверяет лиды в статусе watch.
-    """
+    """Каждые 6 часов перепроверяет лиды в статусе watch."""
     while True:
         await asyncio.sleep(6 * 3600)
-        logger.info("Перепроверяю watch-лиды...")
+        if state.is_paused():
+            continue
         count = await brain_memory.recheck_watch_leads(process_lead)
         if count > 0:
             logger.info(f"Перепроверено {count} watch-лидов")
@@ -152,36 +160,31 @@ async def run_watch_checker():
 # Точка входа
 # ──────────────────────────────────────────────
 async def main():
-    """
-    Запускает все парсеры ПАРАЛЛЕЛЬНО — они работают одновременно.
-    Никаких расписаний. Никаких пауз кроме антибан-задержек.
-    """
     logger.info("=" * 60)
     logger.info("🤖 Zetta Lead Bot стартует...")
     logger.info("Компания: Zetta Group (Узбекистан) | Продукт: iiko")
-    logger.info(f"Активные парсеры: Instagram, OLX, Telegram-каналы")
-    logger.info(f"2GIS: отключён (подключим позже)")
+    logger.info("Парсеры: Instagram, OLX.uz, Telegram-каналы, 2GIS")
+    logger.info("Команды: /status /sources /test /pause /resume")
     logger.info("=" * 60)
 
-    # Инициализируем базу данных
     database.init_db()
     logger.info("База данных готова")
 
-    # Отправляем стартовое сообщение в Telegram
     await tg.send_startup_message()
 
-    # Запускаем все процессы параллельно
     await asyncio.gather(
-        # Парсеры — работают бесконечно
+        # Парсеры
         instagram.run_forever(process_lead),
         olx.run_forever(process_lead),
         tg_channels.run_forever(process_lead),
-        # Утренний дайджест
+        twogis.run_forever(process_lead),
+        # Дайджест и перепроверка
         run_daily_digest(),
-        # Перепроверка watch-лидов (каждые 6 часов)
         run_watch_checker(),
-        # Самообучение (каждые 24 часа)
+        # Самообучение
         brain_learning.run_forever(notify_func=tg.send_message),
+        # Telegram-команды (/status /sources /test /pause /resume)
+        command_bot.run_forever(trigger_test_func=run_one_test_cycle),
     )
 
 
