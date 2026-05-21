@@ -8,7 +8,7 @@ load_dotenv()
 
 # Anthropic Claude
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-opus-4-5"
 
 # Telegram — все уведомления только на TELEGRAM_CHAT_ID
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
