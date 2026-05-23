@@ -899,19 +899,13 @@ async def handle_schedule_command(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Any text from owner → generate a post on that topic, OR edit pending post if one exists."""
+    """Text from owner → always generate a new post on that topic. Editing is via buttons only."""
     if update.effective_user.id != YOUR_PERSONAL_ID:
         return
     text = update.message.text.strip()
-    # If there is a post waiting for review — treat message as manual text edit
-    owner_posts = [(pid, e) for pid, e in pending_posts.items() if e["stage"] == "owner"]
-    if owner_posts:
-        post_id, entry = owner_posts[-1]
-        entry["text"] = text
-        await update.message.reply_text("✏️ Текст поста обновлён.", reply_markup=build_owner_keyboard(post_id))
-        logger.info(f"Post {post_id} text edited by owner.")
+    if not text:
         return
-    # No pending post — generate a new post on this topic
+    # Always generate a fresh post — never auto-edit pending posts (use "Другой текст" button)
     import uuid
     post_id = str(uuid.uuid4())[:8]
     pending_posts[post_id] = {
