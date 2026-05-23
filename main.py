@@ -499,45 +499,77 @@ FORMAT_WHEEL_RU: list[str] = [
     ),
 ]
 
-def generate_post(post_type: str, topic: str | None = None) -> str:
+BLOGGER_SYSTEM = (
+    "Ты — эксперт по ресторанному бизнесу и системе iiko в Узбекистане. "
+    "Пишешь посты для Telegram-канала в стиле популярного бизнес-блогера. "
+    "Контекст: рестораторы Ташкента и Узбекистана, цифры в сумах, только русский язык.\n\n"
+    "СТРУКТУРА каждого поста:\n"
+    "1. Провокационный заголовок с неожиданным фактом или вопросом + 1-2 эмодзи\n"
+    "2. 4-5 нумерованных пунктов в формате:\n"
+    "   01 — **ЗАГОЛОВОК КАПСОМ** (жирный)\n"
+    "   «Пример реальной фразы официанта, управляющего или системы»\n"
+    "   → Объяснение почему это работает / что даёт владельцу\n"
+    "3. Финальный вывод: 1-2 предложения, польза для владельца ресторана\n"
+    "4. Последняя строка без изменений: Связаться: @iikoman\n\n"
+    "ЖЁСТКИЕ ПРАВИЛА:\n"
+    "— 200-250 слов, не меньше и не больше\n"
+    "— Жирный через **двойные звёздочки** ТОЛЬКО для заголовков пунктов\n"
+    "— Реальные цифры в сумах (например: 4 800 000 сум/мес)\n"
+    "— Анонимные примеры: «один ташкентский ресторан», «сеть кафе в Узбекистане»\n"
+    "— НЕ реклама: запрещено писать «купи iiko», «Zetta Group», «обратитесь к нам»\n"
+    "— Текст завершён полностью — никогда не обрывай на полуслове\n"
+    "— Только текст поста, без пояснений типа «Вот пост:»"
+)
+
+QUIZ_TOPICS: dict[str, str] = {
+    "stoplist":       "Стоп-лист в реальном времени в iiko",
+    "loyalty":        "Программа лояльности в iiko",
+    "revenue":        "Удалённый контроль выручки через iiko",
+    "suppliers":      "Автоматический заказ у поставщиков через iiko",
+    "staff_analytics": "Аналитика по официантам в iiko",
+    "banquet":        "Банкетное бронирование в iiko",
+    "kds":            "KDS — кухонный экран в iiko",
+    "food_cost":      "Контроль себестоимости блюд в iiko",
+    "tables":         "Управление столами и залом в iiko",
+    "delivery":       "Интеграция iiko с доставкой",
+}
+
+def generate_post(post_type: str = "lifehack", topic: str | None = None) -> str:
     if topic is None:
         topic = get_next_topic()
-    persona = PERSONAS_RU[post_type]
-    fmt = random.choice(FORMAT_WHEEL_RU)
     news_context = fetch_news_context()
     if news_context and post_type == "news":
         news_block = (
-            f"\n\nСВЕЖИЕ ЗАГОЛОВКИ из отраслевых изданий (используй как источник вдохновения):\n\n"
+            f"\n\nСВЕЖИЕ ЗАГОЛОВКИ из отраслевых изданий (используй как вдохновение):\n\n"
             f"{news_context}\n\n"
         )
-    elif news_context:
-        news_block = f"\n\nКОНТЕКСТ из отраслевых новостей:\n\n{news_context}\n\n"
     else:
         news_block = ""
-    content = (
-        f"{persona}\n\n"
-        f"ТЕМА ПОСТА: {topic}\n\n"
-        f"{fmt}\n"
-        f"{news_block}"
-        f"ЖЁСТКИЕ ПРАВИЛА:\n"
-        f"— Контекст ТОЛЬКО Узбекистан/Ташкент: цифры, районы, реалии местного рынка\n"
-        f"— Фокус поста — ТОЛЬКО та функция iiko, которая указана в теме\n"
-        f"— Цифры обязательны: суммы в сумах, проценты, временные показатели\n"
-        f"— Анонимные примеры только: один ташкентский ресторан, сеть кафе в Узбекистане и т.п.\n"
-        f"— НЕ реклама: никогда купи iiko, Zetta Group, обратитесь к нам\n"
-        f"— 180-220 слов, только русский язык\n"
-        f"— КРИТИЧНО: текст должен быть завершён полностью — никогда не обрывай на полуслове\n"
-        f"— Эмодзи: 2-4 штуки, только по смыслу — не декоративные\n"
-        f"— ЗАПРЕЩЕНО начинать пост словами: Лайфхак, Совет, Внимание, Представьте\n"
-        f"— Каждый пост должен начинаться УНИКАЛЬНО — первые 5 слов не должны быть шаблонными\n"
-        f"— Последняя строка без изменений: Связаться: @iikoman\n"
-        f"— Только текст поста, без заголовков типа Пост: и без пояснений"
-    )
-    logger.info(f"Generating post — type={post_type}, format={fmt[:25].strip()!r}")
+    user_msg = f"Напиши пост на тему: {topic}{news_block}"
+    logger.info(f"Generating blogger post — type={post_type}, topic={topic[:50]!r}")
     msg = client.messages.create(
         model="claude-opus-4-5",
-        max_tokens=1400,
-        messages=[{"role": "user", "content": content}],
+        max_tokens=1600,
+        system=BLOGGER_SYSTEM,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    post = msg.content[0].text.strip()
+    if "Связаться: @iikoman" not in post:
+        post = f"{post}\n\nСвязаться: @iikoman"
+    return post
+
+async def generate_post_on_topic(topic: str) -> str:
+    """Generate a blogger-style post on an arbitrary user-supplied topic."""
+    user_msg = f"Напиши пост на тему: {topic}"
+    logger.info(f"Generating on-demand post — topic={topic[:60]!r}")
+    msg = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1600,
+            system=BLOGGER_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+        )
     )
     post = msg.content[0].text.strip()
     if "Связаться: @iikoman" not in post:
@@ -552,6 +584,24 @@ def build_type_keyboard(post_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📊 Полезный разбор", callback_data=f"type_deepdive:{post_id}")],
         [InlineKeyboardButton("🎲 Случайный тип",   callback_data=f"type_random:{post_id}")],
     ])
+
+
+def build_quiz_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        ("1. Стоп-лист в реальном времени",   "stoplist"),
+        ("2. Программа лояльности",            "loyalty"),
+        ("3. Удалённый контроль выручки",      "revenue"),
+        ("4. Автозаказ у поставщиков",         "suppliers"),
+        ("5. Аналитика по официантам",         "staff_analytics"),
+        ("6. Банкетное бронирование",          "banquet"),
+        ("7. KDS — кухонный экран",            "kds"),
+        ("8. Контроль себестоимости блюд",     "food_cost"),
+        ("9. Управление столами и залом",      "tables"),
+        ("10. Интеграция с доставкой",         "delivery"),
+    ]
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=f"quiz_topic:{key}")] for label, key in rows]
+    )
 
 def build_owner_keyboard(post_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -796,8 +846,43 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def handle_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != YOUR_PERSONAL_ID:
         return
-    logger.info("Type selection sent via /test.")
-    await send_type_selection(context.application)
+    logger.info("Quiz sent via /test.")
+    await update.message.reply_text(
+        "Выбери тему для поста 👇",
+        reply_markup=build_quiz_keyboard(),
+    )
+
+async def handle_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle quiz topic button press — generate and send post to owner for approval."""
+    query = update.callback_query
+    await query.answer()
+    key = query.data.split(":", 1)[1]
+    topic = QUIZ_TOPICS.get(key, key)
+    await query.edit_message_text(f"⏳ Генерирую пост на тему:\n{topic}...")
+    import uuid
+    post_id = str(uuid.uuid4())[:8]
+    pending_posts[post_id] = {
+        "text": None, "photo_url": None, "stage": "owner",
+        "post_type": "lifehack", "group_approvals": set(), "group_message_id": None, "topic": topic,
+    }
+    post = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: generate_post("lifehack", topic)
+    )
+    photo_url = pick_photo("lifehack", topic)
+    pending_posts[post_id].update({"text": post, "photo_url": photo_url})
+    keyboard = build_owner_keyboard(post_id)
+    if photo_url:
+        try:
+            await context.bot.send_photo(chat_id=YOUR_PERSONAL_ID, photo=photo_url)
+        except Exception as e:
+            logger.warning(f"Quiz photo send failed: {e}")
+    await context.bot.send_message(
+        chat_id=YOUR_PERSONAL_ID,
+        text=_md_to_html(f"[{topic}]\n\n{post}"),
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+    logger.info(f"Quiz post {post_id} sent to owner (topic={topic[:40]!r}).")
 
 
 async def handle_schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -813,18 +898,43 @@ async def handle_schedule_command(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
-async def handle_edited_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Any text from owner → generate a post on that topic, OR edit pending post if one exists."""
     if update.effective_user.id != YOUR_PERSONAL_ID:
         return
-    text = update.message.text
+    text = update.message.text.strip()
+    # If there is a post waiting for review — treat message as manual text edit
     owner_posts = [(pid, e) for pid, e in pending_posts.items() if e["stage"] == "owner"]
-    if not owner_posts:
-        await update.message.reply_text("Нет постов на стадии проверки.")
+    if owner_posts:
+        post_id, entry = owner_posts[-1]
+        entry["text"] = text
+        await update.message.reply_text("✏️ Текст поста обновлён.", reply_markup=build_owner_keyboard(post_id))
+        logger.info(f"Post {post_id} text edited by owner.")
         return
-    post_id, entry = owner_posts[-1]
-    entry["text"] = text
-    await update.message.reply_text("✏️ Текст обновлён.", reply_markup=build_owner_keyboard(post_id))
-    logger.info(f"Post {post_id} text edited by owner.")
+    # No pending post — generate a new post on this topic
+    import uuid
+    post_id = str(uuid.uuid4())[:8]
+    pending_posts[post_id] = {
+        "text": None, "photo_url": None, "stage": "owner",
+        "post_type": "lifehack", "group_approvals": set(), "group_message_id": None, "topic": text,
+    }
+    await update.message.reply_text(f"⏳ Генерирую пост на тему:\n{text}...")
+    post = await generate_post_on_topic(text)
+    photo_url = pick_photo("lifehack", text)
+    pending_posts[post_id].update({"text": post, "photo_url": photo_url})
+    keyboard = build_owner_keyboard(post_id)
+    if photo_url:
+        try:
+            await context.bot.send_photo(chat_id=YOUR_PERSONAL_ID, photo=photo_url)
+        except Exception as e:
+            logger.warning(f"Text-topic photo failed: {e}")
+    await context.bot.send_message(
+        chat_id=YOUR_PERSONAL_ID,
+        text=_md_to_html(f"[{text}]\n\n{post}"),
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+    logger.info(f"Text-topic post {post_id} sent to owner (topic={text[:40]!r}).")
 
 
 async def handle_telegram_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -866,11 +976,18 @@ def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("test",     handle_test_command))
     app.add_handler(CommandHandler("schedule", handle_schedule_command))
-    app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(type_news:|type_lifehack:|type_deepdive:|type_random:|owner_approve:|reject:|regen:|change_photo:|change_text:|send_now:|group_approve:|group_reject:)"))
+    app.add_handler(CallbackQueryHandler(
+        handle_quiz_callback,
+        pattern=r"^quiz_topic:",
+    ))
+    app.add_handler(CallbackQueryHandler(
+        handle_callback,
+        pattern=r"^(type_news:|type_lifehack:|type_deepdive:|type_random:|owner_approve:|reject:|regen:|change_photo:|change_text:|send_now:|group_approve:|group_reject:)",
+    ))
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.User(YOUR_PERSONAL_ID),
-            handle_edited_post,
+            handle_text_message,
         )
     )
     app.add_error_handler(handle_telegram_error)
