@@ -980,7 +980,7 @@ def main() -> None:
     ))
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.User(YOUR_PERSONAL_ID),
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE & filters.User(YOUR_PERSONAL_ID),
             handle_text_message,
         )
     )
