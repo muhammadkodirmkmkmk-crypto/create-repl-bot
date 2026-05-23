@@ -1,203 +1,828 @@
-"""
-Zetta Lead Bot — автономный AI-агент для поиска лидов 24/7.
-Компания Zetta Group (Узбекистан), продукт: iiko (автоматизация ресторанов).
-
-Запуск: python main.py
-"""
+import os
+import random
 import asyncio
 import logging
 import sys
-from datetime import datetime, timedelta
-
-import database
-import state
-from brain import decision as brain_decision
-from brain import learning as brain_learning
-from brain import memory as brain_memory
-from notifier import telegram_bot as tg
-from notifier import command_bot
-from notifier import post_generator
-from parsers import instagram, olx, tg_channels, twogis
-from config import SCORE_HOT, SCORE_WARM, DIGEST_HOUR
-
-# ──────────────────────────────────────────────
-# Настройка логирования — только stdout (Railway не поддерживает файлы)
-# ──────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
+import time
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import anthropic
+import requests
+from bs4 import BeautifulSoup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Conflict as TelegramConflict
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler,
+    MessageHandler, filters, ContextTypes,
 )
-logger = logging.getLogger("zetta_bot")
 
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
 
+ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+YOUR_PERSONAL_ID   = int(os.environ["YOUR_PERSONAL_ID"])
+PEXELS_API_KEY     = os.environ.get("PEXELS_API_KEY", "")
+CHANNEL_USERNAME   = os.environ.get("CHANNEL_USERNAME", "@zetta_uzbekistan")
+APPROVAL_GROUP_ID  = int(os.environ.get("APPROVAL_GROUP_ID", "-5160536788"))
+GROUP_APPROVALS_NEEDED = int(os.environ.get("GROUP_APPROVALS_NEEDED", "2"))
 
-# ──────────────────────────────────────────────
-# Обработка одного лида
-# ──────────────────────────────────────────────
-async def process_lead(raw_data: dict):
-    """
-    Полный цикл:
-      1. Claude анализирует лид
-      2. Проверяем дубль и сохраняем
-      3. Уведомляем владельца (TELEGRAM_CHAT_ID)
-      4. Если горячий лид — генерируем пост и публикуем в канал (TELEGRAM_CHANNEL_ID)
-    """
-    source = raw_data.get("source", "unknown")
-    name = raw_data.get("name", "Без названия")
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    logger.info(f"[{source.upper()}] Обрабатываю: {name}")
+pending_posts: dict[str, dict] = {}
 
-    decision = await brain_decision.analyze_venue(raw_data)
-    if not decision:
-        logger.warning(f"Claude не смог проанализировать: {name}")
-        database.update_source_stats(source, found=1, error=True)
-        return
-
-    decision_type = decision.get("decision", "skip")
-    score = decision.get("lead_quality", {}).get("score", 0)
-    logger.info(f"[{source.upper()}] Решение: {decision_type} | Скор: {score} | {name}")
-
-    lead_id, is_dup = await brain_memory.check_and_save_lead(raw_data, decision)
-    if is_dup:
-        database.update_source_stats(source, found=1)
-        return
-
-    msg_id = None
-
-    if decision_type == "send_now":
-        logger.info(f"🔥 ГОРЯЧИЙ ЛИД: {name} (score={score})")
-
-        # Уведомление владельцу
-        msg_id = await tg.notify_hot_lead(raw_data, decision)
-        if lead_id and msg_id:
-            database.mark_lead_sent(lead_id, msg_id)
-        database.update_source_stats(source, found=1, sent=1, hot=1, score=score)
-
-        # Публикация поста в Telegram-канал (с лимитами)
-        await post_generator.try_post_to_channel(raw_data, decision)
-
-    elif decision_type == "send_digest":
-        logger.info(f"📋 Тёплый лид в дайджест: {name} (score={score})")
-        database.update_source_stats(source, found=1, score=score)
-
-    elif decision_type == "watch":
-        logger.info(f"👁 На наблюдении: {name}")
-        msg_id = await tg.notify_watch_lead(raw_data, decision)
-        if lead_id and msg_id:
-            database.mark_lead_sent(lead_id, msg_id)
-        database.update_source_stats(source, found=1)
-
-    elif decision_type == "skip":
-        logger.info(f"⏭ Пропуск: {name}")
-        database.update_source_stats(source, found=1)
-
-
-# ──────────────────────────────────────────────
-# Тестовый прогон (вызывается командой /test)
-# ──────────────────────────────────────────────
-async def run_one_test_cycle():
-    """
-    Немедленно запускает один прогон всех парсеров.
-    Используется командой /test.
-    """
-    logger.info("Тестовый прогон запущен...")
-    results = await asyncio.gather(
-        olx.fetch_new_items(),
-        tg_channels.fetch_new_items(),
-        twogis.fetch_new_items(),
-        instagram.fetch_new_items(),
-        return_exceptions=True,
+SCRAPE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
     )
-    total = 0
-    for batch in results:
-        if isinstance(batch, list):
-            for item in batch[:3]:
+}
+SCRAPE_TIMEOUT = 5
+
+TOPIC_PHOTO_KEYWORDS: list[tuple[str, str]] = [
+    ("food cost",    "restaurant kitchen cost"),
+    ("себестоимост", "restaurant kitchen cost"),
+    ("техкарт",      "restaurant kitchen recipe"),
+    ("ABC",          "restaurant analytics data"),
+    ("аналитик",     "restaurant analytics data"),
+    ("инвентариза",  "warehouse food inventory"),
+    ("склад",        "warehouse food storage"),
+    ("KDS",          "restaurant kitchen display screen"),
+    ("кухн",         "restaurant kitchen chef"),
+    ("официант",     "restaurant waiter service"),
+    ("стоп-лист",    "restaurant menu tablet"),
+    ("модификатор",  "restaurant pos tablet"),
+    ("доставк",      "food delivery courier"),
+    ("лояльност",    "restaurant loyalty customer"),
+    ("смен",         "restaurant manager shift"),
+    ("персонал",     "restaurant team staff"),
+    ("меню",         "restaurant menu design"),
+    ("стол",         "restaurant table dining"),
+    ("банкет",       "restaurant banquet event"),
+    ("автоматиза",   "restaurant automation technology"),
+]
+
+TYPE_DEFAULT_QUERY = {
+    "news":     "restaurant industry news",
+    "lifehack": "restaurant pos system tablet",
+    "deepdive": "restaurant kitchen management",
+}
+
+
+def _topic_to_query(topic: str, post_type: str) -> str:
+    topic_lower = topic.lower()
+    for keyword, query in TOPIC_PHOTO_KEYWORDS:
+        if keyword.lower() in topic_lower:
+            return query
+    return TYPE_DEFAULT_QUERY.get(post_type, "restaurant")
+
+
+def _fetch_pexels_photo(query: str) -> str | None:
+    if not PEXELS_API_KEY:
+        return None
+    try:
+        resp = requests.get(
+            "https://api.pexels.com/v1/search",
+            params={"query": query, "orientation": "landscape", "per_page": 15},
+            headers={"Authorization": PEXELS_API_KEY},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        photos = resp.json().get("photos", [])
+        if photos:
+            url = random.choice(photos)["src"]["large"]
+            logger.info(f"Pexels photo fetched for '{query}'")
+            return url
+    except Exception as e:
+        logger.warning(f"Pexels failed for '{query}': {e}")
+    return None
+
+
+def pick_photo(post_type: str = "lifehack", topic: str = "") -> str | None:
+    query = _topic_to_query(topic, post_type)
+    return _fetch_pexels_photo(query)
+
+
+TOPICS_BY_FEATURE: dict[str, list[str]] = {
+    "kds": [
+        "KDS в iiko: как кухонный экран сокращает время отдачи блюд",
+        "Маршрутизация заказов на KDS: какое блюдо на какой экран",
+        "Цветовая индикация на KDS: как повара видят приоритет без слов",
+        "Время приготовления в KDS: как iiko измеряет и зачем это менеджеру",
+    ],
+    "stoplist": [
+        "Стоп-лист в iiko: три способа поставить позицию и чем они отличаются",
+        "Автоматический стоп-лист: как склад сам блокирует продажи при нуле остатка",
+        "Стоп-лист и официант: как это предотвращает конфликты с гостями",
+        "Частичный стоп-лист в iiko: ограничить продажи, но не убирать из меню",
+        "Синхронизация стоп-листа с агрегаторами доставки в iiko",
+    ],
+    "abc_analysis": [
+        "ABC-анализ меню в iiko: какие блюда тянут прибыль вниз незаметно",
+        "Матрица меню iiko: звёзды, рабочие лошадки, загадки и балласт",
+        "ABC по выручке vs ABC по прибыли — почему результаты разные",
+        "Как часто делать ABC-анализ и когда менять меню на основе данных",
+        "Инжиниринг меню через iiko: убрать «собак» и усилить «звёзд»",
+    ],
+    "food_cost": [
+        "Food cost в iiko: как система считает себестоимость блюда в реальном времени",
+        "Плановый vs фактический food cost: что значит расхождение больше 3%",
+        "Потери при обработке в iiko: почему 1 кг говядины даёт 650 г готового продукта",
+        "Полуфабрикаты в iiko: как составной ингредиент снижает ошибки в техкартах",
+        "Себестоимость с учётом модификаторов: iiko считает каждый вариант блюда",
+    ],
+    "modifiers": [
+        "Модификаторы в iiko: разница между обязательными и опциональными группами",
+        "Как настроить модификаторы так, чтобы официант не пропустил выбор соуса",
+        "Модификаторы и себестоимость: почему каждый топпинг должен быть в техкарте",
+        "Платные vs бесплатные модификаторы: как iiko считает финальную цену блюда",
+        "Комбо и сеты в iiko: настройка и влияние на средний чек",
+    ],
+    "loyalty": [
+        "Программа лояльности в iiko: бонусы, скидки и кешбэк — что выгоднее ресторану",
+        "Гостевая база iiko: какие данные собирать и как использовать для возврата гостей",
+        "Персональные акции в iiko: настройка скидки на день рождения без ручного труда",
+        "RFM-анализ гостей в iiko: как найти «засыпающих» клиентов до ухода",
+        "Бонусные баллы в iiko: срок сгорания, минимальное списание и психология удержания",
+    ],
+    "delivery": [
+        "Доставка в iiko: как заказ с агрегатора попадает прямо на кухонный экран",
+        "iiko и внешние агрегаторы: синхронизация стоп-листа в реальном времени",
+        "Зоны доставки в iiko: привязка к адресу и расчёт стоимости",
+        "Статусы доставки в iiko: как повар, упаковщик и курьер видят один заказ",
+        "Интеграция iiko с Yandex Go и local-агрегаторами в Узбекистане",
+    ],
+    "inventory": [
+        "Инвентаризация в iiko за 20 минут: правильный порядок зон и сотрудников",
+        "Акт списания в iiko: когда списывать и что будет без документа",
+        "Пересорт на складе iiko: почему возникает и как ручная коррекция ломает аналитику",
+        "Минимальный остаток в iiko: автоуведомления до того, как кончился продукт",
+        "Инвентаризация без остановки зала в iiko: лайфхак для занятых ресторанов",
+    ],
+    "staff": [
+        "Рейтинг официантов в iiko: средний чек, количество гостей, скорость",
+        "Контроль скидок в iiko: отчёт, который ловит злоупотребления персонала",
+        "Права доступа в iiko: почему кассир не должен видеть склад",
+        "Табель учёта рабочего времени в iiko: автоматический расчёт по открытию смены",
+        "Нарушения кассовой дисциплины: какие действия сотрудника iiko логирует всегда",
+        "График персонала в iiko: планирование смен и контроль выхода",
+    ],
+    "table_management": [
+        "Схема зала в iiko: как правильно нарисовать и зачем это влияет на оборот стола",
+        "Резервирование столов в iiko: привязка к гостевой базе и история визитов",
+        "Перенос заказа между столами в iiko: 30 секунд вместо пересоздания",
+        "Банкет в iiko: предзаказ, депозит и разбивка счёта на несколько гостей",
+        "Время ожидания у стола в iiko: когда менеджер получает алерт",
+    ],
+    "financial_reports": [
+        "P&L отчёт в iiko: как владелец видит прибыль ресторана за день в реальном времени",
+        "Отчёт по выручке в iiko: разбивка по официантам, столам, категориям блюд",
+        "Сравнение периодов в iiko: как найти причину падения выручки за неделю",
+        "Финансовая аналитика iiko: какие 5 цифр должен смотреть владелец каждое утро",
+        "Отчёт по скидкам и промо в iiko: считаем реальную стоимость акций",
+    ],
+    "waste_tracking": [
+        "Учёт списаний в iiko: как фиксировать потери и не терять деньги дважды",
+        "Списание по причинам в iiko: порча, проба, брак — и что каждая категория говорит о кухне",
+        "Норма потерь в iiko: как установить лимит и получать алерт при превышении",
+        "Waste tracking в iiko: связь между списаниями и реальным food cost",
+        "Акт переработки в iiko: когда продукт меняет форму и как это учесть",
+    ],
+    "recipe_costing": [
+        "Технологическая карта в iiko: пошаговое создание и привязка к складу",
+        "Техкарта с несколькими единицами измерения в iiko: граммы, штуки, порции",
+        "Версионность техкарт в iiko: как менять рецептуру без потери истории",
+        "Себестоимость сезонного блюда в iiko: как менять цену ингредиента и пересчитывать",
+        "Техкарта для заготовок в iiko: полуфабрикаты и многоуровневые рецепты",
+    ],
+    "shift_reports": [
+        "Отчёт по закрытию смены в iiko: 7 показателей, которые менеджер обязан проверить",
+        "Кассовые расхождения в iiko: как система фиксирует и почему нельзя игнорировать",
+        "X-отчёт и Z-отчёт в iiko: в чём разница и когда использовать каждый",
+        "Почасовой отчёт продаж в iiko: как найти провальные и пиковые часы",
+        "Смена без закрытия в iiko: что происходит с данными и как исправить",
+    ],
+    "api_integrations": [
+        "iiko и Payme/Click: как автоматизировать приём безналичных платежей в Ташкенте",
+        "API iiko: какие интеграции уже доступны на рынке Узбекистана",
+        "iiko и системы видеоаналитики: как камера считает гостей и передаёт данные в систему",
+        "Интеграция iiko с 1С: что синхронизируется и что остаётся ручным",
+        "iiko и телеграм-боты: автоматические отчёты владельцу без открытия системы",
+    ],
+}
+
+_feature_queue: list[str] = []
+_last_feature: str | None = None
+_feature_topic_indices: dict[str, int] = {f: 0 for f in TOPICS_BY_FEATURE}
+
+
+def _refill_feature_queue() -> None:
+    global _feature_queue
+    keys = list(TOPICS_BY_FEATURE.keys())
+    random.shuffle(keys)
+    if keys and keys[0] == _last_feature:
+        keys.append(keys.pop(0))
+    _feature_queue = keys
+
+
+def get_next_topic() -> str:
+    global _last_feature, _feature_queue
+    if not _feature_queue:
+        _refill_feature_queue()
+    chosen_feature = _feature_queue.pop(0)
+    idx = _feature_topic_indices[chosen_feature]
+    topics = TOPICS_BY_FEATURE[chosen_feature]
+    topic = topics[idx % len(topics)]
+    _feature_topic_indices[chosen_feature] = idx + 1
+    _last_feature = chosen_feature
+    logger.info(f"Topic feature: [{chosen_feature}] -> {topic[:60]}")
+    return topic
+
+
+def _scrape_headlines(url: str) -> list[str]:
+    resp = requests.get(url, headers=SCRAPE_HEADERS, timeout=SCRAPE_TIMEOUT)
+    resp.raise_for_status()
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(resp.text, "lxml")
+    seen: set[str] = set()
+    results: list[str] = []
+    for tag in soup.find_all(["h1", "h2", "h3"]) + soup.find_all("a", href=True):
+        text = tag.get_text(separator=" ", strip=True)
+        if 15 < len(text) < 200 and text not in seen:
+            seen.add(text)
+            results.append(text)
+        if len(results) >= 8:
+            break
+    return results
+
+
+def _scrape_rss(url: str) -> list[str]:
+    import xml.etree.ElementTree as ET
+    resp = requests.get(url, headers=SCRAPE_HEADERS, timeout=SCRAPE_TIMEOUT)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+    results: list[str] = []
+    for item in root.iter("item"):
+        title = item.findtext("title", "").strip()
+        if title and 15 < len(title) < 200:
+            results.append(title)
+        if len(results) >= 10:
+            break
+    return results
+
+
+def fetch_news_context() -> str | None:
+    html_sources = [
+        ("gazeta.uz", "https://www.gazeta.uz/ru/"),
+        ("daryo.uz",  "https://daryo.uz/ru"),
+    ]
+    rss_sources = [
+        ("Google: restoran UZ",
+         "https://news.google.com/rss/search?q=%D1%80%D0%B5%D1%81%D1%82%D0%BE%D1%80%D0%B0%D0%BD+%D0%A3%D0%B7%D0%B1%D0%B5%D0%BA%D0%B8%D1%81%D1%82%D0%B0%D0%BD&hl=ru&gl=UZ&ceid=UZ:ru"),
+        ("Google: cafe Tashkent",
+         "https://news.google.com/rss/search?q=%D0%BA%D0%B0%D1%84%D0%B5+%D0%A2%D0%B0%D1%88%D0%BA%D0%B5%D0%BD%D1%82+%D0%BE%D0%B1%D1%89%D0%B5%D0%BF%D0%B8%D1%82&hl=ru&gl=UZ&ceid=UZ:ru"),
+        ("Google: HoReCa",
+         "https://news.google.com/rss/search?q=HoReCa+%D0%B0%D0%B2%D1%82%D0%BE%D0%BC%D0%B0%D1%82%D0%B8%D0%B7%D0%B0%D1%86%D0%B8%D1%8F+%D1%80%D0%B5%D1%81%D1%82%D0%BE%D1%80%D0%B0%D0%BD&hl=ru&gl=UZ&ceid=UZ:ru"),
+        ("Google: biznes CA",
+         "https://news.google.com/rss/search?q=%D1%80%D0%B5%D1%81%D1%82%D0%BE%D1%80%D0%B0%D0%BD%D0%BD%D1%8B%D0%B9+%D0%B1%D0%B8%D0%B7%D0%BD%D0%B5%D1%81+%D0%A6%D0%B5%D0%BD%D1%82%D1%80%D0%B0%D0%BB%D1%8C%D0%BD%D0%B0%D1%8F+%D0%90%D0%B7%D0%B8%D1%8F&hl=ru&gl=UZ&ceid=UZ:ru"),
+    ]
+    blocks: list[str] = []
+    for name, url in html_sources:
+        try:
+            h = _scrape_headlines(url)
+            if h:
+                blocks.append(f"[{name}]\n" + "\n".join(f"- {x}" for x in h))
+                logger.info(f"Scraped {len(h)} headlines from {name}")
+        except Exception as e:
+            logger.warning(f"Scraping failed for {name}: {e}")
+    for name, url in rss_sources:
+        try:
+            h = _scrape_rss(url)
+            if h:
+                blocks.append(f"[{name}]\n" + "\n".join(f"- {x}" for x in h))
+                logger.info(f"Fetched {len(h)} RSS items from {name}")
+        except Exception as e:
+            logger.warning(f"RSS fetch failed for {name}: {e}")
+    return "\n\n".join(blocks) if blocks else None
+
+
+TYPE_LABELS = {
+    "news":     "Свежая новость",
+    "lifehack": "Лайфхак iiko",
+    "deepdive": "Полезный разбор",
+}
+
+FORMAT_WHEEL: list[str] = [
+    (
+        "ФОРМАТ - ЛОВУШКА:\n"
+        "Первые 2 строки - ложное убеждение, которое кажется правильным большинству рестораторов Ташкента. "
+        "Сформулируй его уверенно, как будто это общепринятая истина.\n"
+        "Потом резкий разворот: На самом деле... - и разбей это убеждение конкретными цифрами.\n"
+        "Объясни механику: почему ошибка такая распространённая и сколько она стоит в сумах.\n"
+        "Финал: как iiko показывает правду - конкретная функция + результат анонимного заведения."
+    ),
+    (
+        "ФОРМАТ - ЖИВАЯ СЦЕНА:\n"
+        "Первые 3 строки - кинематографичная сцена из ташкентского ресторана. "
+        "Конкретное время (пятница 20:00), место (кухня, касса, зал), человек (шеф, кассир, управляющий). "
+        "Без имён заведений. Читатель должен увидеть картинку.\n"
+        "Следующий абзац: почему эта сцена - симптом системной проблемы, цифры потерь.\n"
+        "Затем: что в iiko закрывает это - конкретная функция, как работает.\n"
+        "Финал: измеримый результат, анонимное заведение."
+    ),
+    (
+        "ФОРМАТ - ДО/ПОСЛЕ:\n"
+        "Опиши одну конкретную операцию ДО iiko: ручной процесс, потери в сумах или часах, хаос. "
+        "Без воды, только боль и цифры.\n"
+        "Потом то же самое ПОСЛЕ iiko: конкретная функция, сколько времени или денег экономит каждый месяц.\n"
+        "Финал: конкретная разница в сумах или процентах, анонимное заведение Ташкента."
+    ),
+    (
+        "ФОРМАТ - ПРОВОКАЦИЯ:\n"
+        "Начни с резкого вопроса или спорного тезиса который задевает ресторатора. "
+        "Пример уровня: Вы теряете X сум каждый день - и даже не знаете об этом.\n"
+        "Следующий абзац: докажи тезис - конкретная механика потерь, цифры.\n"
+        "Затем: решение через iiko - точное название функции, как использовать.\n"
+        "Финал: результат, анонимный кейс."
+    ),
+    (
+        "ФОРМАТ - МИНИ-ИСТОРИЯ:\n"
+        "Короткая история с началом, проблемой и развязкой. "
+        "Герой - анонимный ресторатор из Ташкента (без имён и названий). "
+        "Начало: всё шло как обычно. Проблема: что-то пошло не так, цифры потерь. "
+        "Развязка: нашли в iiko, настроили конкретную функцию, получили результат.\n"
+        "Эмоциональная дуга: от тревоги к облегчению. Реалистичные цифры."
+    ),
+    (
+        "ФОРМАТ - ЦИФРА В ЛОБ:\n"
+        "Первая строка - одно shocking число крупно и без предисловий. "
+        "Пример: 3 400 000 сум. Столько теряет средний ташкентский ресторан за год на немаркированных списаниях.\n"
+        "Следующий абзац: откуда эта цифра берётся, операционная механика, кто в зоне риска.\n"
+        "Затем: как iiko это видит и контролирует - конкретная функция.\n"
+        "Финал: что изменилось после настройки, анонимный пример."
+    ),
+    (
+        "ФОРМАТ - ДИАЛОГ:\n"
+        "Начни с короткого диалога (3-4 реплики) между управляющим и официантом, поваром или кассиром. "
+        "Диалог показывает проблему - только живая речь. Без имён, без названий заведений.\n"
+        "После диалога: объясни почему это системная проблема, цифры потерь.\n"
+        "Затем: как iiko убирает эту проблему - конкретная функция, конкретные шаги.\n"
+        "Финал: результат в числах."
+    ),
+    (
+        "ФОРМАТ - АНТИСОВЕТ:\n"
+        "Начни с Не делайте X - типичная ошибка при настройке или использовании iiko "
+        "которую допускают большинство ресторанов Ташкента.\n"
+        "Объясни что ломается от этой ошибки: конкретная цепочка последствий, потери в сумах.\n"
+        "Затем: как делать правильно - конкретные шаги, точное название функции iiko.\n"
+        "Финал: результат после исправления, анонимный кейс."
+    ),
+]
+
+PERSONAS = {
+    "news": (
+        "Ты - старший аналитик HoReCa-рынка Узбекистана, бывший операционный директор сети из 12 "
+        "ресторанов в Ташкенте. Пишешь как журналист-расследователь: каждый тезис - цифра, "
+        "каждый вывод - механика, ни одного слова-паразита."
+    ),
+    "lifehack": (
+        "Ты - сертифицированный специалист по внедрению iiko. За 8 лет настроил систему в 160+ "
+        "ресторанах Ташкента и Узбекистана. Знаешь каждую кнопку, каждый отчёт, каждую ловушку. "
+        "Говоришь как практик: точно, конкретно, без академической воды."
+    ),
+    "deepdive": (
+        "Ты - управляющий партнёр ресторанной группы в Ташкенте (4 заведения, выручка 800 млн сум "
+        "в год), сертифицированный эксперт iiko. Пишешь аналитику для владельцев HoReCa Узбекистана."
+    ),
+}
+
+
+def generate_post(post_type: str, topic: str | None = None) -> str:
+    if topic is None:
+        topic = get_next_topic()
+    persona = PERSONAS[post_type]
+    fmt = random.choice(FORMAT_WHEEL)
+    news_context = fetch_news_context()
+    if news_context and post_type == "news":
+        news_block = (
+            f"\n\nСВЕЖИЕ ЗАГОЛОВКИ из отраслевых изданий (используй как источник вдохновения):\n\n"
+            f"{news_context}\n\n"
+        )
+    elif news_context:
+        news_block = (
+            f"\n\nКОНТЕКСТ из отраслевых новостей:\n\n{news_context}\n\n"
+        )
+    else:
+        news_block = ""
+    content = (
+        f"{persona}\n\n"
+        f"ТЕМА ПОСТА: {topic}\n\n"
+        f"{fmt}\n"
+        f"{news_block}"
+        f"ЖЁСТКИЕ ПРАВИЛА:\n"
+        f"- Контекст ТОЛЬКО Узбекистан/Ташкент: цифры, районы, реалии местного рынка\n"
+        f"- Фокус поста - ТОЛЬКО та функция iiko, которая указана в теме\n"
+        f"- Цифры обязательны: суммы в сумах, проценты, временные показатели\n"
+        f"- Анонимные примеры только: один ташкентский ресторан, сеть кафе в Узбекистане и т.п.\n"
+        f"- НЕ реклама: никогда купи iiko, Zetta Group, обратитесь к нам\n"
+        f"- 180-220 слов, только русский язык\n"
+        f"- КРИТИЧНО: текст должен быть завершён полностью\n"
+        f"- Эмодзи: 2-4 штуки, только по смыслу\n"
+        f"- ЗАПРЕЩЕНО начинать пост словами: Лайфхак, Совет, Внимание, Представьте\n"
+        f"- Каждый пост должен начинаться УНИКАЛЬНО\n"
+        f"- Последняя строка без изменений: Связаться: @iikoman\n"
+        f"- Только текст поста, без заголовков типа Пост: и без пояснений"
+    )
+    logger.info(f"Generating post - type={post_type}, format={fmt[:30].strip()!r}")
+    msg = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1400,
+        messages=[{"role": "user", "content": content}],
+    )
+    post = msg.content[0].text.strip()
+    if "Связаться: @iikoman" not in post:
+        post = f"{post}\n\nСвязаться: @iikoman"
+    return post
+
+
+def build_type_keyboard(post_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Свежая новость",  callback_data=f"type_news:{post_id}")],
+        [InlineKeyboardButton("Лайфхак iiko",    callback_data=f"type_lifehack:{post_id}")],
+        [InlineKeyboardButton("Полезный разбор", callback_data=f"type_deepdive:{post_id}")],
+        [InlineKeyboardButton("Случайный тип",   callback_data=f"type_random:{post_id}")],
+    ])
+
+
+def build_owner_keyboard(post_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Одобрить -> группа", callback_data=f"owner_approve:{post_id}"),
+            InlineKeyboardButton("Отклонить",           callback_data=f"reject:{post_id}"),
+        ],
+        [
+            InlineKeyboardButton("Переделать",   callback_data=f"regen:{post_id}"),
+            InlineKeyboardButton("Другое фото",  callback_data=f"change_photo:{post_id}"),
+        ],
+        [InlineKeyboardButton("Другой текст",    callback_data=f"change_text:{post_id}")],
+    ])
+
+
+def build_group_keyboard(post_id: str, count: int) -> InlineKeyboardMarkup:
+    label = f"Опубликовать ({count}/{GROUP_APPROVALS_NEEDED})"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(label,         callback_data=f"group_approve:{post_id}"),
+            InlineKeyboardButton("Отклонить",   callback_data=f"group_reject:{post_id}"),
+        ],
+    ])
+
+
+def _new_pending(stage: str = "type_select") -> dict:
+    return {
+        "text": None,
+        "photo_url": None,
+        "stage": stage,
+        "post_type": None,
+        "group_approvals": set(),
+        "group_message_id": None,
+    }
+
+
+async def send_type_selection(app: Application) -> None:
+    import uuid
+    post_id = str(uuid.uuid4())[:8]
+    pending_posts[post_id] = _new_pending("type_select")
+    await app.bot.send_message(
+        chat_id=YOUR_PERSONAL_ID,
+        text="Выберите тип поста:",
+        reply_markup=build_type_keyboard(post_id),
+    )
+    logger.info(f"Type-selection menu sent for post {post_id}.")
+
+
+async def _generate_and_send_to_owner(bot, post_id: str, post_type: str) -> None:
+    topic = get_next_topic()
+    post = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: generate_post(post_type, topic)
+    )
+    photo_url = pick_photo(post_type, topic)
+    entry = pending_posts.get(post_id)
+    if entry is None:
+        return
+    entry.update({"text": post, "photo_url": photo_url, "stage": "owner",
+                  "post_type": post_type, "topic": topic})
+    label = TYPE_LABELS[post_type]
+    keyboard = build_owner_keyboard(post_id)
+    if photo_url:
+        try:
+            await bot.send_photo(chat_id=YOUR_PERSONAL_ID, photo=photo_url)
+        except Exception as e:
+            logger.warning(f"Owner photo send failed ({e}), skipping photo.")
+    await bot.send_message(
+        chat_id=YOUR_PERSONAL_ID,
+        text=f"[{label}]\n\n{post}",
+        reply_markup=keyboard,
+    )
+    logger.info(f"Post {post_id} ({post_type}) sent to owner.")
+
+
+async def _forward_to_group(bot, post_id: str) -> None:
+    entry = pending_posts[post_id]
+    post = entry["text"]
+    photo_url = entry["photo_url"]
+    label = TYPE_LABELS.get(entry.get("post_type", "lifehack"), "Пост")
+    count = len(entry["group_approvals"])
+    keyboard = build_group_keyboard(post_id, count)
+    if photo_url:
+        try:
+            await bot.send_photo(chat_id=APPROVAL_GROUP_ID, photo=photo_url)
+        except Exception as e:
+            logger.warning(f"Group photo send failed ({e}), continuing without photo.")
+    msg = await bot.send_message(
+        chat_id=APPROVAL_GROUP_ID,
+        text=f"[{label}] На проверку:\n\n{post}",
+        reply_markup=keyboard,
+    )
+    entry["stage"] = "group"
+    entry["group_message_id"] = msg.message_id
+    logger.info(f"Post {post_id} forwarded to group for vote.")
+
+
+async def _safe_edit(query, text: str) -> None:
+    try:
+        await query.edit_message_caption(text)
+    except Exception:
+        try:
+            await query.edit_message_text(text)
+        except Exception:
+            pass
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    action, post_id = query.data.split(":", 1)
+    entry = pending_posts.get(post_id)
+    if entry is None:
+        await _safe_edit(query, "Пост уже обработан или не найден.")
+        return
+    stage = entry["stage"]
+
+    if action.startswith("type_") and stage == "type_select":
+        chosen = action[5:]
+        if chosen == "random":
+            chosen = random.choice(["news", "lifehack", "deepdive"])
+        try:
+            await query.edit_message_text(f"Генерирую: {TYPE_LABELS[chosen]}...")
+        except Exception:
+            pass
+        await _generate_and_send_to_owner(context.bot, post_id, chosen)
+
+    elif action == "owner_approve" and stage == "owner":
+        await _safe_edit(query, f"Одобрено. Отправлено в группу.\n\n{entry['text']}")
+        await _forward_to_group(context.bot, post_id)
+
+    elif action == "group_approve" and stage == "group":
+        user_id = update.effective_user.id
+        user_name = update.effective_user.first_name or "Участник"
+        approvals: set = entry["group_approvals"]
+        if user_id in approvals:
+            await query.answer("Вы уже проголосовали", show_alert=True)
+            return
+        approvals.add(user_id)
+        count = len(approvals)
+        logger.info(f"Post {post_id}: {count}/{GROUP_APPROVALS_NEEDED} approvals ({user_name})")
+        if count >= GROUP_APPROVALS_NEEDED:
+            post = entry["text"]
+            photo_url = entry["photo_url"]
+            if photo_url:
                 try:
-                    await process_lead(item)
-                    total += 1
+                    await context.bot.send_photo(chat_id=CHANNEL_USERNAME, photo=photo_url)
                 except Exception as e:
-                    logger.error(f"Ошибка в тестовом прогоне: {e}")
-    logger.info(f"Тестовый прогон завершён: обработано {total} заведений")
-
-
-# ──────────────────────────────────────────────
-# Утренний дайджест
-# ──────────────────────────────────────────────
-async def run_daily_digest():
-    """Каждый день в DIGEST_HOUR:00 отправляет дайджест тёплых лидов."""
-    while True:
-        now = datetime.now()
-        target = now.replace(hour=DIGEST_HOUR, minute=0, second=0, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
-
-        wait_seconds = (target - now).total_seconds()
-        logger.info(f"Дайджест: следующая отправка через {wait_seconds / 3600:.1f} часов")
-        await asyncio.sleep(wait_seconds)
-
-        leads = database.get_digest_leads()
-        if leads:
-            await tg.send_daily_digest(leads)
-            for lead in leads:
-                database.mark_lead_sent(lead.id)
-            logger.info(f"Дайджест отправлен: {len(leads)} тёплых лидов")
+                    logger.warning(f"Channel photo failed ({e}), skipping photo.")
+            await context.bot.send_message(chat_id=CHANNEL_USERNAME, text=post)
+            del pending_posts[post_id]
+            await _safe_edit(query, f"Опубликовано ({count}/{GROUP_APPROVALS_NEEDED})!\n\n{post}")
+            await context.bot.send_message(
+                chat_id=YOUR_PERSONAL_ID,
+                text=f"Пост опубликован в {CHANNEL_USERNAME}.",
+            )
+            logger.info(f"Post {post_id} published to channel.")
         else:
-            logger.info("Нет тёплых лидов для дайджеста")
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=build_group_keyboard(post_id, count)
+                )
+            except Exception:
+                pass
+            await query.answer(f"Голос принят ({count}/{GROUP_APPROVALS_NEEDED})", show_alert=True)
+
+    elif action == "group_reject" and stage == "group":
+        rejecter = update.effective_user.first_name or "Участник группы"
+        post = entry["text"]
+        del pending_posts[post_id]
+        await _safe_edit(query, f"Пост отклонён ({rejecter}).")
+        await context.bot.send_message(
+            chat_id=YOUR_PERSONAL_ID,
+            text=f"Пост отклонён группой ({rejecter}):\n\n{post}",
+        )
+        logger.info(f"Post {post_id} rejected by group ({rejecter}).")
+
+    elif action == "reject" and stage == "owner":
+        del pending_posts[post_id]
+        await _safe_edit(query, "Пост отклонён.")
+        logger.info(f"Post {post_id} rejected by owner.")
+
+    elif action == "change_photo" and stage == "owner":
+        post_type = entry.get("post_type", "lifehack")
+        new_photo = pick_photo(post_type, entry.get("topic", ""))
+        entry["photo_url"] = new_photo
+        keyboard = build_owner_keyboard(post_id)
+        try:
+            await context.bot.send_photo(
+                chat_id=YOUR_PERSONAL_ID,
+                photo=new_photo,
+                caption=entry["text"],
+                reply_markup=keyboard,
+            )
+            await _safe_edit(query, "Новое фото - смотрите сообщение выше.")
+        except Exception as e:
+            logger.warning(f"change_photo failed: {e}")
+            await _safe_edit(query, "Ошибка при смене фото.")
+
+    elif action == "change_text" and stage == "owner":
+        post_type = entry.get("post_type", "lifehack")
+        photo_url = entry["photo_url"]
+        await _safe_edit(query, "Генерирую новый текст, фото остаётся...")
+        new_post = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: generate_post(post_type)
+        )
+        entry["text"] = new_post
+        keyboard = build_owner_keyboard(post_id)
+        try:
+            await context.bot.send_photo(
+                chat_id=YOUR_PERSONAL_ID, photo=photo_url,
+                caption=new_post, reply_markup=keyboard,
+            )
+        except Exception as e:
+            logger.warning(f"change_text photo failed: {e}")
+            await context.bot.send_message(
+                chat_id=YOUR_PERSONAL_ID, text=new_post, reply_markup=keyboard
+            )
+
+    elif action == "regen" and stage == "owner":
+        import uuid
+        post_type = entry.get("post_type", "lifehack")
+        del pending_posts[post_id]
+        await _safe_edit(query, "Генерирую новый пост...")
+        new_id = str(uuid.uuid4())[:8]
+        pending_posts[new_id] = _new_pending("owner")
+        pending_posts[new_id]["post_type"] = post_type
+        await _generate_and_send_to_owner(context.bot, new_id, post_type)
+
+    elif action == "send_now" and stage == "owner":
+        post = entry["text"]
+        photo_url = entry["photo_url"]
+        if photo_url:
+            try:
+                await context.bot.send_photo(chat_id=CHANNEL_USERNAME, photo=photo_url)
+            except Exception as e:
+                logger.warning(f"send_now photo failed ({e}), skipping photo.")
+        await context.bot.send_message(chat_id=CHANNEL_USERNAME, text=post)
+        del pending_posts[post_id]
+        await _safe_edit(query, f"Опубликовано напрямую!\n\n{post}")
+        logger.info(f"Post {post_id} published directly (send_now).")
 
 
-# ──────────────────────────────────────────────
-# Перепроверка watch-лидов
-# ──────────────────────────────────────────────
-async def run_watch_checker():
-    """Каждые 6 часов перепроверяет лиды в статусе watch."""
-    while True:
-        await asyncio.sleep(6 * 3600)
-        if state.is_paused():
-            continue
-        count = await brain_memory.recheck_watch_leads(process_lead)
-        if count > 0:
-            logger.info(f"Перепроверено {count} watch-лидов")
+async def handle_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != YOUR_PERSONAL_ID:
+        return
+    logger.info("Type selection sent via /test.")
+    await send_type_selection(context.application)
 
 
-# ──────────────────────────────────────────────
-# Точка входа
-# ──────────────────────────────────────────────
-async def main():
-    logger.info("=" * 60)
-    logger.info("🤖 Zetta Lead Bot стартует...")
-    logger.info("Компания: Zetta Group (Узбекистан) | Продукт: iiko")
-    logger.info("Парсеры: Instagram, OLX.uz, Telegram-каналы, 2GIS")
-    logger.info("Команды: /status /sources /test /pause /resume")
-    logger.info("=" * 60)
-
-    database.init_db()
-    logger.info("База данных готова")
-
-    await tg.send_startup_message()
-
-    await asyncio.gather(
-        instagram.run_forever(process_lead),
-        olx.run_forever(process_lead),
-        tg_channels.run_forever(process_lead),
-        twogis.run_forever(process_lead),
-        run_daily_digest(),
-        run_watch_checker(),
-        brain_learning.run_forever(notify_func=tg.send_message),
-        command_bot.run_forever(trigger_test_func=run_one_test_cycle),
+async def handle_schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != YOUR_PERSONAL_ID:
+        return
+    import datetime
+    tz = pytz.timezone("Asia/Tashkent")
+    now_str = datetime.datetime.now(tz).strftime("%H:%M")
+    text = (
+        f"Текущее время (Ташкент): {now_str}\n"
+        f"Расписание постов:\n"
+        f"  09:00 - утренний пост\n"
+        f"  13:00 - дневной пост\n"
+        f"  19:00 - вечерний пост\n"
+        f"Канал: {CHANNEL_USERNAME}"
     )
+    await update.message.reply_text(text)
+
+
+async def handle_edited_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != YOUR_PERSONAL_ID:
+        return
+    text = update.message.text
+    owner_stage_posts = [
+        (pid, e) for pid, e in pending_posts.items() if e["stage"] == "owner"
+    ]
+    if not owner_stage_posts:
+        await update.message.reply_text("Нет постов на стадии проверки.")
+        return
+    post_id, entry = owner_stage_posts[-1]
+    entry["text"] = text
+    await update.message.reply_text(
+        "Текст поста обновлён.",
+        reply_markup=build_owner_keyboard(post_id),
+    )
+    logger.info(f"Post {post_id} text edited by owner.")
+
+
+async def handle_telegram_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, TelegramConflict):
+        logger.warning("409 Conflict - reclaiming polling session...")
+        await asyncio.sleep(3)
+        logger.info("Polling session reclaimed via error handler.")
+        return
+    logger.error(f"Unhandled bot error: {context.error}", exc_info=context.error)
+
+
+_scheduler = BackgroundScheduler(timezone=pytz.timezone("Asia/Tashkent"))
+_main_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _schedule_post(app: Application) -> None:
+    if _main_loop is None:
+        logger.warning("Event loop not ready - skipping scheduled post.")
+        return
+    asyncio.run_coroutine_threadsafe(send_type_selection(app), _main_loop)
+
+
+def apply_schedule(app: Application) -> None:
+    tz = pytz.timezone("Asia/Tashkent")
+    for hour in [9, 13, 19]:
+        _scheduler.add_job(
+            _schedule_post,
+            trigger=CronTrigger(hour=hour, minute=0, timezone=tz),
+            args=[app],
+            id=f"post_{hour}",
+            replace_existing=True,
+        )
+    logger.info("Scheduler configured: 09:00, 13:00, 19:00 Tashkent")
+
+
+def _force_claim_polling_session() -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
+            json={"drop_pending_updates": True},
+            timeout=10,
+        )
+        logger.info("Webhook deleted.")
+    except Exception as e:
+        logger.warning(f"deleteWebhook error: {e}")
+    logger.info("Claiming polling session...")
+    for attempt in range(40):
+        try:
+            resp = requests.post(url, json={"timeout": 0, "limit": 1}, timeout=10)
+            logger.info(f"  Session claim attempt {attempt + 1}: HTTP {resp.status_code}")
+            if resp.status_code == 200:
+                logger.info("Polling session claimed successfully.")
+                return
+        except Exception as e:
+            logger.warning(f"  Claim attempt {attempt + 1} error: {e}")
+        time.sleep(2)
+    logger.warning("Could not claim polling session after 40 attempts - starting anyway.")
+
+
+def main() -> None:
+    global _main_loop
+    _force_claim_polling_session()
+    _main_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_main_loop)
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("test", handle_test_command))
+    app.add_handler(CommandHandler("schedule", handle_schedule_command))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.User(YOUR_PERSONAL_ID),
+            handle_edited_post,
+        )
+    )
+    app.add_error_handler(handle_telegram_error)
+    apply_schedule(app)
+    _scheduler.start()
+    logger.info("iiko channel bot is running - 09:00 / 13:00 / 19:00 Tashkent")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен вручную (KeyboardInterrupt)")
-    except Exception as e:
-        logger.critical(f"Критическая ошибка: {e}", exc_info=True)
-        sys.exit(1)
+    main()
