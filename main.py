@@ -5,6 +5,8 @@ import logging
 import sys
 import signal
 import time
+import re as _re
+import html as _html
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -55,6 +57,17 @@ SCRAPE_HEADERS = {
     )
 }
 SCRAPE_TIMEOUT = 5
+
+
+# ── Markdown helpers ──────────────────────────────────────────────────────────
+def _md_to_html(text: str) -> str:
+    """Convert **bold** → <b>bold</b> for Telegram HTML parse_mode."""
+    safe = _html.escape(text)
+    return _re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", safe, flags=_re.DOTALL)
+
+def _strip_bold(text: str) -> str:
+    """Remove **bold** markers — for plain-text contexts."""
+    return _re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=_re.DOTALL)
 
 # ── Photo helpers ─────────────────────────────────────────────────────────────
 TOPIC_PHOTO_KEYWORDS: list[tuple[str, str]] = [
@@ -600,7 +613,7 @@ async def _generate_and_send_to_owner(bot, post_id: str, post_type: str) -> None
             logger.warning(f"Owner photo send failed ({e}), skipping photo.")
     await bot.send_message(
         chat_id=YOUR_PERSONAL_ID,
-        text=f"[{label}]\n\n{post}",
+        text=_md_to_html(f"[{label}]\n\n{post}"), parse_mode="HTML",
         reply_markup=keyboard,
     )
     logger.info(f"Post {post_id} ({post_type}) sent to owner.")
@@ -619,7 +632,7 @@ async def _forward_to_group(bot, post_id: str) -> None:
             logger.warning(f"Group photo send failed ({e}), continuing.")
     msg = await bot.send_message(
         chat_id=APPROVAL_GROUP_ID,
-        text=f"📋 [{label}] На проверку:\n\n{post}",
+        text=_strip_bold(f"📋 [{label}] На проверку:\n\n{post}"),
         reply_markup=keyboard,
     )
     entry["stage"] = "group"
@@ -686,9 +699,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     await context.bot.send_photo(chat_id=CHANNEL_USERNAME, photo=photo_url)
                 except Exception as e:
                     logger.warning(f"Channel photo failed ({e}), skipping.")
-            await context.bot.send_message(chat_id=CHANNEL_USERNAME, text=post)
+            await context.bot.send_message(
+                chat_id=CHANNEL_USERNAME, text=_md_to_html(post), parse_mode="HTML"
+            )
             del pending_posts[post_id]
-            await _safe_edit(query, f"✅ Опубликовано ({count}/{GROUP_APPROVALS_NEEDED})!\n\n{post}")
+            await _safe_edit(query, _strip_bold(f"✅ Опубликовано ({count}/{GROUP_APPROVALS_NEEDED})!\n\n{post}"))
             await context.bot.send_message(
                 chat_id=YOUR_PERSONAL_ID,
                 text=f"✅ Пост опубликован в {CHANNEL_USERNAME}.",
