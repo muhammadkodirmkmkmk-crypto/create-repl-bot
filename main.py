@@ -41,7 +41,7 @@ YOUR_PERSONAL_ID       = int(os.environ["YOUR_PERSONAL_ID"])
 PEXELS_API_KEY         = os.environ.get("PEXELS_API_KEY", "")
 CHANNEL_USERNAME       = os.environ.get("CHANNEL_USERNAME", "@zetta_uzbekistan")
 APPROVAL_GROUP_ID      = int(os.environ.get("APPROVAL_GROUP_ID", "-5160536788"))
-GROUP_APPROVALS_NEEDED = int(os.environ.get("GROUP_APPROVALS_NEEDED", "2"))
+GROUP_APPROVALS_NEEDED = int(os.environ.get("GROUP_APPROVALS_NEEDED", "1"))
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -638,8 +638,15 @@ async def _safe_edit(query, text: str) -> None:
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    # Ignore callbacks from other bots / other projects in the same group
+    data = query.data or ""
+    KNOWN = ("type_news:","type_lifehack:","type_deepdive:","type_random:",
+             "owner_approve:","reject:","regen:","change_photo:","change_text:",
+             "send_now:","group_approve:","group_reject:")
+    if not any(data.startswith(p) for p in KNOWN):
+        return
     await query.answer()
-    action, post_id = query.data.split(":", 1)
+    action, post_id = data.split(":", 1)
     entry = pending_posts.get(post_id)
     if entry is None:
         await _safe_edit(query, "⚠️ Пост уже обработан или не найден.")
@@ -844,7 +851,7 @@ def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("test",     handle_test_command))
     app.add_handler(CommandHandler("schedule", handle_schedule_command))
-    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(type_news:|type_lifehack:|type_deepdive:|type_random:|owner_approve:|reject:|regen:|change_photo:|change_text:|send_now:|group_approve:|group_reject:)"))
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.User(YOUR_PERSONAL_ID),
