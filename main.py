@@ -16,6 +16,7 @@ from brain import learning as brain_learning
 from brain import memory as brain_memory
 from notifier import telegram_bot as tg
 from notifier import command_bot
+from notifier import post_generator
 from parsers import instagram, olx, tg_channels, twogis
 from config import SCORE_HOT, SCORE_WARM, DIGEST_HOUR
 
@@ -41,7 +42,11 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 # ──────────────────────────────────────────────
 async def process_lead(raw_data: dict):
     """
-    Полный цикл: Claude анализирует → проверяем дубль → отправляем в Telegram.
+    Полный цикл:
+      1. Claude анализирует лид
+      2. Проверяем дубль и сохраняем
+      3. Уведомляем владельца (TELEGRAM_CHAT_ID)
+      4. Если горячий лид — генерируем пост и публикуем в канал (TELEGRAM_CHANNEL_ID)
     """
     source = raw_data.get("source", "unknown")
     name = raw_data.get("name", "Без названия")
@@ -67,10 +72,15 @@ async def process_lead(raw_data: dict):
 
     if decision_type == "send_now":
         logger.info(f"🔥 ГОРЯЧИЙ ЛИД: {name} (score={score})")
+
+        # Уведомление владельцу
         msg_id = await tg.notify_hot_lead(raw_data, decision)
         if lead_id and msg_id:
             database.mark_lead_sent(lead_id, msg_id)
         database.update_source_stats(source, found=1, sent=1, hot=1, score=score)
+
+        # Публикация поста в Telegram-канал (с лимитами)
+        await post_generator.try_post_to_channel(raw_data, decision)
 
     elif decision_type == "send_digest":
         logger.info(f"📋 Тёплый лид в дайджест: {name} (score={score})")
