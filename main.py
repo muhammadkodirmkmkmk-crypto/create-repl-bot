@@ -905,6 +905,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = update.message.text.strip()
     if not text:
         return
+    # Ignore phone numbers, pure digits, and very short strings — not valid post topics
+    if text.isdigit() or len(text) < 5 or all(c in "0123456789 +-.()" for c in text):
+        logger.info(f"Ignored non-topic message: {text!r}")
+        return
     # Always generate a fresh post — never auto-edit pending posts (use "Другой текст" button)
     import uuid
     post_id = str(uuid.uuid4())[:8]
