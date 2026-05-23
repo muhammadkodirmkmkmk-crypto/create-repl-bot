@@ -1,7 +1,0 @@
-anthropic
-requests
-apscheduler
-pytz
-python-telegram-bot
-beautifulsoup4
-lxml
