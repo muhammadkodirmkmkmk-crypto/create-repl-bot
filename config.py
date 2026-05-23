@@ -10,9 +10,16 @@ load_dotenv()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = "claude-opus-4-5"
 
-# Telegram — все уведомления только на TELEGRAM_CHAT_ID
+# Telegram — личные уведомления владельцу
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Telegram — публикация в канал
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")
+
+# Лимиты публикаций в канал
+MAX_POSTS_PER_DAY = int(os.getenv("MAX_POSTS_PER_DAY", "2"))
+MIN_HOURS_BETWEEN_POSTS = int(os.getenv("MIN_HOURS_BETWEEN_POSTS", "4"))
 
 # 2GIS — работает без API ключа через demo + веб-скрапинг
 TWOGIS_API_KEY = os.getenv("TWOGIS_API_KEY", "")
@@ -68,7 +75,7 @@ INSTAGRAM_HASHTAGS = [
     "uzbekistanfood",
 ]
 
-# OLX ключевые слова (теперь расширенный список в parsers/olx.py)
+# OLX ключевые слова
 OLX_KEYWORDS = [
     "под кафе",
     "под ресторан",
@@ -85,6 +92,3 @@ REGIONS = ["Ташкент", "Самарканд", "Бухара", "Ферган
 
 # Путь к базе данных
 DATABASE_URL = "sqlite:///zetta_bot.db"
-
-# Путь к файлу логов
-LOG_FILE = "zetta_bot.log"
